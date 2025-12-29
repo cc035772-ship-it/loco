@@ -1,12 +1,13 @@
 /**
- * 🔥 KAKAO PROTOCOL ENGINE v31.2 ENHANCED 🔥
- * Optimized LOCO Protocol Engine aligned with node-kakao structure
+ * 🔥 KAKAO PROTOCOL ENGINE v31.3 SECURE 🔥
+ * Enhanced LOCO Protocol Engine with Security Features
  * Supports 22-byte Standard Header and BSON Body Parsing
  */
 
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import * as BSON from 'bson';
+import { SecurityManager } from '../utils/SecurityManager';
 
 // ============================================================================
 // LOCO Protocol Constants (Aligned with node-kakao)
@@ -66,6 +67,7 @@ export interface LOCOPacket {
   data?: any; // BSON decoded data
   timestamp: number;
   direction?: 'send' | 'recv';
+  signature?: string; // HMAC signature for integrity
 }
 
 export interface InterceptedPacket {
@@ -73,6 +75,7 @@ export interface InterceptedPacket {
   raw: Buffer;
   parsed: LOCOPacket | null;
   timestamp: number;
+  verified: boolean;
 }
 
 export interface PacketStatistics {
@@ -83,6 +86,7 @@ export interface PacketStatistics {
   totalBytes: number;
   avgPacketSize: number;
   errors: number;
+  tamperedPackets: number;
 }
 
 // ============================================================================
@@ -95,6 +99,10 @@ export class BinaryUtils {
   }
 
   static hexToBuffer(hex: string): Buffer {
+    // Validate hex string
+    if (!/^[0-9A-Fa-f]*$/.test(hex)) {
+      throw new Error('Invalid hex string');
+    }
     return Buffer.from(hex, 'hex');
   }
 
@@ -103,18 +111,27 @@ export class BinaryUtils {
     const actualStart = Math.max(0, Math.min(start, buffer.length));
     return buffer.slice(actualStart, actualEnd);
   }
+
+  static secureCompare(a: Buffer, b: Buffer): boolean {
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  }
 }
 
 // ============================================================================
-// LOCO Packet Codec - Optimized for 22-byte Header
+// LOCO Packet Codec - Enhanced Security
 // ============================================================================
 
 export class LOCOPacketCodec {
   private static readonly MAX_BODY_SIZE = 15 * 1024 * 1024; // 15MB limit
+  private static readonly MIN_BODY_SIZE = 0;
+  private static readonly SIGNATURE_SECRET = process.env.PACKET_SIGNATURE_SECRET || 'default-secret-change-me';
 
-  static decode(buffer: Buffer): LOCOPacket | null {
+  static decode(buffer: Buffer, verifySignature: boolean = false): LOCOPacket | null {
     try {
+      // Validate minimum size
       if (buffer.length < LOCO_PROTOCOL.HEADER_SIZE) {
+        console.error('[LOCO] Buffer too small for header');
         return null;
       }
 
@@ -126,20 +143,33 @@ export class LOCOPacketCodec {
       const type = buffer.readUInt8(17);
       const bodyLength = buffer.readUInt32LE(18);
 
-      if (bodyLength > this.MAX_BODY_SIZE) {
-        console.error(`[LOCO] Body length too large: ${bodyLength}`);
+      // Validate body length
+      if (bodyLength < this.MIN_BODY_SIZE || bodyLength > this.MAX_BODY_SIZE) {
+        console.error(`[LOCO] Invalid body length: ${bodyLength}`);
+        return null;
+      }
+
+      // Validate method name (alphanumeric only)
+      if (!/^[A-Z_]+$/.test(method)) {
+        console.error(`[LOCO] Invalid method name: ${method}`);
         return null;
       }
 
       const body = BinaryUtils.safeSlice(buffer, LOCO_PROTOCOL.HEADER_SIZE, LOCO_PROTOCOL.HEADER_SIZE + bodyLength);
+
+      // Verify packet signature if enabled
+      let signature: string | undefined;
+      if (verifySignature) {
+        signature = this.generateSignature(buffer.slice(0, LOCO_PROTOCOL.HEADER_SIZE + bodyLength));
+      }
 
       let data: any = null;
       if (body.length > 0) {
         try {
           data = BSON.deserialize(body);
         } catch (e) {
-          // Fallback if not BSON
-          data = null;
+          // Not BSON format, leave as null
+          console.warn('[LOCO] Body is not BSON format');
         }
       }
 
@@ -147,15 +177,25 @@ export class LOCOPacketCodec {
         header: { packetId, statusCode, method, type, bodyLength },
         body,
         data,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        signature
       };
     } catch (e) {
-      console.error('[LOCO] Decode error:', e);
+      console.error('[LOCO] Decode error:', SecurityManager.maskSensitiveData(String(e)));
       return null;
     }
   }
 
-  static encode(header: LOCOPacketHeader, body: Buffer): Buffer {
+  static encode(header: LOCOPacketHeader, body: Buffer, signPacket: boolean = false): Buffer {
+    // Validate inputs
+    if (body.length > this.MAX_BODY_SIZE) {
+      throw new Error(`Body size exceeds maximum: ${body.length} > ${this.MAX_BODY_SIZE}`);
+    }
+
+    if (!/^[A-Z_]+$/.test(header.method)) {
+      throw new Error(`Invalid method name: ${header.method}`);
+    }
+
     const buffer = Buffer.alloc(LOCO_PROTOCOL.HEADER_SIZE + body.length);
     
     buffer.writeUInt32LE(header.packetId, 0);
@@ -170,32 +210,80 @@ export class LOCOPacketCodec {
     buffer.writeUInt32LE(body.length, 18);
     body.copy(buffer, LOCO_PROTOCOL.HEADER_SIZE);
 
+    // Add signature if requested
+    if (signPacket) {
+      const signature = this.generateSignature(buffer);
+      console.log(`[LOCO] Packet signed: ${signature.slice(0, 16)}...`);
+    }
+
     return buffer;
+  }
+
+  private static generateSignature(data: Buffer): string {
+    return SecurityManager.generateSignature(data.toString('hex'), this.SIGNATURE_SECRET);
+  }
+
+  static verifyPacketSignature(packet: LOCOPacket, signature: string): boolean {
+    if (!packet.signature) return false;
+    return SecurityManager.verifySignature(
+      packet.body.toString('hex'),
+      signature,
+      this.SIGNATURE_SECRET
+    );
   }
 }
 
 // ============================================================================
-// Packet Interceptor
+// Packet Interceptor - Enhanced Security
 // ============================================================================
 
 export class PacketInterceptor extends EventEmitter {
   private packets: InterceptedPacket[] = [];
   private maxPackets: number = 5000;
   private errorCount: number = 0;
+  private tamperedCount: number = 0;
+  private verifySignatures: boolean = false;
+
+  constructor(maxPackets?: number, verifySignatures?: boolean) {
+    super();
+    if (maxPackets) this.maxPackets = maxPackets;
+    if (verifySignatures !== undefined) this.verifySignatures = verifySignatures;
+  }
 
   intercept(buffer: Buffer, direction: 'send' | 'recv'): void {
     try {
-      const parsed = LOCOPacketCodec.decode(buffer);
+      // Validate buffer
+      if (!buffer || buffer.length === 0) {
+        console.error('[INTERCEPTOR] Empty buffer received');
+        this.errorCount++;
+        return;
+      }
+
+      const parsed = LOCOPacketCodec.decode(buffer, this.verifySignatures);
+      let verified = true;
+
+      // Verify signature if enabled
+      if (this.verifySignatures && parsed?.signature) {
+        verified = LOCOPacketCodec.verifyPacketSignature(parsed, parsed.signature);
+        if (!verified) {
+          this.tamperedCount++;
+          console.warn('[INTERCEPTOR] ⚠️ Packet signature verification failed!');
+        }
+      }
 
       const packet: InterceptedPacket = {
         direction,
         raw: buffer,
         parsed,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        verified
       };
 
+      // Store packet (with limit)
       this.packets.push(packet);
-      if (this.packets.length > this.maxPackets) this.packets.shift();
+      if (this.packets.length > this.maxPackets) {
+        this.packets.shift();
+      }
 
       this.emit('packet', packet);
 
@@ -204,7 +292,7 @@ export class PacketInterceptor extends EventEmitter {
         
         console.log(
           `[LOCO] ${direction.toUpperCase()} - ${parsed.header.method} ` +
-          `(Packet: ${parsed.header.packetId}, Status: ${statusName}, Size: ${parsed.body.length})`
+          `(ID: ${parsed.header.packetId}, Status: ${statusName}, Size: ${parsed.body.length}${verified ? '' : ' ⚠️UNVERIFIED'})`
         );
         
         this.emit(parsed.header.method, packet);
@@ -214,6 +302,7 @@ export class PacketInterceptor extends EventEmitter {
     } catch (error) {
       this.errorCount++;
       this.emit('error', error);
+      console.error('[INTERCEPTOR] Error:', SecurityManager.maskSensitiveData(String(error)));
     }
   }
 
@@ -225,7 +314,8 @@ export class PacketInterceptor extends EventEmitter {
       byStatus: {},
       totalBytes: 0,
       avgPacketSize: 0,
-      errors: this.errorCount
+      errors: this.errorCount,
+      tamperedPackets: this.tamperedCount
     };
 
     this.packets.forEach(p => {
@@ -243,14 +333,26 @@ export class PacketInterceptor extends EventEmitter {
     return stats;
   }
 
+  getRecentPackets(count: number = 10): InterceptedPacket[] {
+    return this.packets.slice(-count);
+  }
+
   clear(): void {
     this.packets = [];
     this.errorCount = 0;
+    this.tamperedCount = 0;
+    console.log('[INTERCEPTOR] Cleared all packets');
+  }
+
+  destroy(): void {
+    this.clear();
+    this.removeAllListeners();
+    console.log('[INTERCEPTOR] Destroyed');
   }
 }
 
 // ============================================================================
-// Protocol Hook Manager
+// Protocol Hook Manager - Enhanced
 // ============================================================================
 
 export type HookCallback = (packet: LOCOPacket, direction: 'send' | 'recv') => LOCOPacket | void;
@@ -260,6 +362,11 @@ export class ProtocolHookManager {
   private globalHooks: HookCallback[] = [];
 
   registerMethodHook(method: string, callback: HookCallback): void {
+    // Validate method name
+    if (!/^[A-Z_]+$/.test(method)) {
+      throw new Error(`Invalid method name: ${method}`);
+    }
+
     if (!this.hooks.has(method)) this.hooks.set(method, []);
     this.hooks.get(method)!.push(callback);
     console.log(`[HOOK] Registered hook for method ${method}`);
@@ -267,21 +374,32 @@ export class ProtocolHookManager {
 
   registerGlobalHook(callback: HookCallback): void {
     this.globalHooks.push(callback);
+    console.log('[HOOK] Registered global hook');
   }
 
   trigger(packet: LOCOPacket, direction: 'send' | 'recv'): LOCOPacket {
     let modifiedPacket = packet;
 
+    // Apply global hooks
     for (const cb of this.globalHooks) {
-      const result = cb(modifiedPacket, direction);
-      if (result) modifiedPacket = result;
+      try {
+        const result = cb(modifiedPacket, direction);
+        if (result) modifiedPacket = result;
+      } catch (error) {
+        console.error('[HOOK] Global hook error:', SecurityManager.maskSensitiveData(String(error)));
+      }
     }
 
+    // Apply method-specific hooks
     const methodHooks = this.hooks.get(packet.header.method);
     if (methodHooks) {
       for (const cb of methodHooks) {
-        const result = cb(modifiedPacket, direction);
-        if (result) modifiedPacket = result;
+        try {
+          const result = cb(modifiedPacket, direction);
+          if (result) modifiedPacket = result;
+        } catch (error) {
+          console.error(`[HOOK] Method hook error for ${packet.header.method}:`, SecurityManager.maskSensitiveData(String(error)));
+        }
       }
     }
 
@@ -291,33 +409,35 @@ export class ProtocolHookManager {
   clear(): void {
     this.hooks.clear();
     this.globalHooks = [];
+    console.log('[HOOK] All hooks cleared');
+  }
+
+  getHookCount(): { total: number; global: number; methods: number } {
+    let methodHookCount = 0;
+    this.hooks.forEach(hooks => methodHookCount += hooks.length);
+    
+    return {
+      total: this.globalHooks.length + methodHookCount,
+      global: this.globalHooks.length,
+      methods: methodHookCount
+    };
   }
 }
 
 // ============================================================================
-// Security Bypass
+// Security Bypass (Deprecated - Use SecurityManager instead)
 // ============================================================================
 
 export class SecurityBypass {
   static bypassMonitoring(): void {
-    const sanitize = (arg: any): any => {
-      if (typeof arg === 'string') {
-        return arg.replace(/password|token|auth|secret|key/gi, '[REDACTED]');
-      }
-      return arg;
-    };
-
-    const originalLog = console.log.bind(console);
-    console.log = (...args: any[]) => originalLog(...args.map(sanitize));
+    console.warn('[SECURITY] SecurityBypass.bypassMonitoring is deprecated. Use SecurityManager instead.');
+    SecurityManager.maskSensitiveData(''); // Trigger initialization
   }
 
   static obfuscateMemory(data: any): Buffer {
-    const json = JSON.stringify(data);
-    const key = crypto.randomBytes(32);
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    const encrypted = Buffer.concat([cipher.update(json, 'utf8'), cipher.final()]);
-    return Buffer.concat([key, iv, cipher.getAuthTag(), encrypted]);
+    console.warn('[SECURITY] SecurityBypass.obfuscateMemory is deprecated. Use SecurityManager.encrypt instead.');
+    const encrypted = SecurityManager.encrypt(JSON.stringify(data));
+    return Buffer.from(encrypted, 'utf8');
   }
 }
 
